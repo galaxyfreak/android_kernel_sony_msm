@@ -42,6 +42,8 @@
 
 #include "mmc3416x.h"
 
+#define READMD	0
+
 #define MMC3416X_DELAY_TM_MS	10
 
 #define MMC3416X_DELAY_SET_MS	75
@@ -51,13 +53,21 @@
 #define MMC3416X_DEFAULT_INTERVAL_MS	100
 #define MMC3416X_TIMEOUT_SET_MS	15000
 
+#define MMC3416X_SET_INTV	250
+
 #define MMC3416X_PRODUCT_ID	0x06
+
+#define MMC3416X_DEV_NAME	"mmc3416x"
 
 /* POWER SUPPLY VOLTAGE RANGE */
 #define MMC3416X_VDD_MIN_UV	2000000
 #define MMC3416X_VDD_MAX_UV	3300000
 #define MMC3416X_VIO_MIN_UV	1750000
 #define MMC3416X_VIO_MAX_UV	1950000
+
+static u32 read_idx = 0;
+
+static struct i2c_client *this_client;
 
 enum {
 	OBVERSE_X_AXIS_FORWARD = 0,
@@ -249,6 +259,308 @@ exit:
 	mutex_unlock(&memsic->ecompass_lock);
 	return rc;
 }
+
+static int mmc3xxx_i2c_rx_data(char *buf, int len)
+{
+	uint8_t i;
+	struct i2c_msg msgs[] = {
+		{
+			.addr	= this_client->addr,
+			.flags	= 0,
+			.len	= 1,
+			.buf	= buf,
+		},
+		{
+			.addr	= this_client->addr,
+			.flags	= I2C_M_RD,
+			.len	= len,
+			.buf	= buf,
+		}
+	};
+
+	for (i = 0; i < MMC3416X_RETRY_COUNT; i++) {
+		if (i2c_transfer(this_client->adapter, msgs, 2) >= 0) {
+			break;
+		}
+		mdelay(10);
+	}
+
+	if (i >= MMC3416X_RETRY_COUNT) {
+		pr_err("%s: retry over %d\n", __FUNCTION__, MMC3416X_RETRY_COUNT);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int mmc3xxx_i2c_tx_data(char *buf, int len)
+{
+	uint8_t i;
+	struct i2c_msg msg[] = {
+		{
+			.addr	= this_client->addr,
+			.flags	= 0,
+			.len	= len,
+			.buf	= buf,
+		}
+	};
+	
+	for (i = 0; i < MMC3416X_RETRY_COUNT; i++) {
+		if (i2c_transfer(this_client->adapter, msg, 1) >= 0) {
+			break;
+		}
+		mdelay(10);
+	}
+
+	if (i >= MMC3416X_RETRY_COUNT) {
+		pr_err("%s: retry over %d\n", __FUNCTION__, MMC3416X_RETRY_COUNT);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int mmc3416x_open(struct inode *inode, struct file *file)
+{
+	return nonseekable_open(inode, file);
+}
+
+static int mmc3416x_release(struct inode *inode, struct file *file)
+{
+	return 0;
+}
+
+static long mmc3416x_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	void __user *pa = (void __user *)arg;
+	int __user *pa_i = (void __user *)arg;
+	unsigned char data[16] = {0};
+	int vec[3] = {0};
+	int reg;
+	short flag;
+	struct mmc3416x_data *memsic;
+
+	mutex_lock(&memsic->ecompass_lock);
+
+	switch (cmd) {
+	case MMC3416X_IOC_DIAG:
+		if (get_user(reg, pa_i))
+			return -EFAULT;
+		data[0] = (unsigned char)((0xff)&reg);
+		if (mmc3xxx_i2c_rx_data(data, 1) < 0) {
+			return -EFAULT;
+		}
+		if (put_user(data[0], pa_i))
+			return -EFAULT;
+		break;
+	case MMC3416X_IOC_TM:
+		data[0] = MMC3416X_REG_CTRL;
+		data[1] = MMC3416X_CTRL_TM;
+		if (mmc3xxx_i2c_tx_data(data, 2) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		/* wait TM done for coming data read */
+		msleep(MMC3416X_DELAY_TM_MS);
+		break;
+	case MMC3416X_IOC_SET:
+		data[0] = MMC3416X_REG_CTRL;
+		data[1] = MMC3416X_CTRL_REFILL;
+		if (mmc3xxx_i2c_tx_data(data, 2) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		msleep(MMC3416X_DELAY_SET_MS);
+		data[0] = MMC3416X_REG_CTRL;
+		data[1] = MMC3416X_CTRL_SET;
+		if (mmc3xxx_i2c_tx_data(data, 2) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		msleep(1);
+		data[0] = MMC3416X_REG_CTRL;
+		data[1] = 0;
+		if (mmc3xxx_i2c_tx_data(data, 2) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		msleep(MMC3416X_DELAY_SET_MS);
+		break;
+	case MMC3416X_IOC_RESET:
+		data[0] = MMC3416X_REG_CTRL;
+		data[1] = MMC3416X_CTRL_REFILL;
+		if (mmc3xxx_i2c_tx_data(data, 2) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		msleep(MMC3416X_DELAY_RESET_MS);
+		data[0] = MMC3416X_REG_CTRL;
+		data[1] = MMC3416X_CTRL_RESET;
+		if (mmc3xxx_i2c_tx_data(data, 2) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		msleep(1);
+		data[0] = MMC3416X_REG_CTRL;
+		data[1] = 0;
+		if (mmc3xxx_i2c_tx_data(data, 2) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		msleep(1);
+		break;
+	case MMC3416X_IOC_READ:
+		data[0] = MMC3416X_REG_DATA;
+		if (mmc3xxx_i2c_rx_data(data, 6) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		vec[0] = data[1] << 8 | data[0];
+		vec[1] = data[3] << 8 | data[2];
+		vec[2] = data[5] << 8 | data[4];
+		vec[2] = 65536 - vec[2];	
+	/*#if DEBUG
+		printk("[X - %04x] [Y - %04x] [Z - %04x]\n", 
+			vec[0], vec[1], vec[2]);
+	#endif*/
+		if (copy_to_user(pa, vec, sizeof(vec))) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		break;
+	case MMC3416X_IOC_READXYZ:
+		if (!(read_idx % MMC3416X_SET_INTV)) {
+		    data[0] = MMC3416X_REG_CTRL;
+		    data[1] = MMC3416X_CTRL_REFILL;
+		    mmc3xxx_i2c_tx_data(data, 2);
+		    msleep(MMC3416X_DELAY_RESET_MS);
+		    data[0] = MMC3416X_REG_CTRL;
+		    data[1] = MMC3416X_CTRL_RESET;
+		    mmc3xxx_i2c_tx_data(data, 2);
+		    msleep(1);
+		    data[0] = MMC3416X_REG_CTRL;
+		    data[1] = 0;
+		    mmc3xxx_i2c_tx_data(data, 2);
+		    msleep(1);
+
+	        data[0] = MMC3416X_REG_CTRL;
+	        data[1] = MMC3416X_CTRL_REFILL;
+	        mmc3xxx_i2c_tx_data(data, 2);
+	        msleep(MMC3416X_DELAY_SET_MS);
+	        data[0] = MMC3416X_REG_CTRL;
+	        data[1] = MMC3416X_CTRL_SET;
+	        mmc3xxx_i2c_tx_data(data, 2);
+	        msleep(1);
+	        data[0] = MMC3416X_REG_CTRL;
+	        data[1] = 0;
+	        mmc3xxx_i2c_tx_data(data, 2);
+	        msleep(1);
+		}
+		/* send TM cmd before read */
+		data[0] = MMC3416X_REG_CTRL;
+		data[1] = MMC3416X_CTRL_TM;
+		/* not check return value here, assume it always OK */
+		mmc3xxx_i2c_tx_data(data, 2);
+		/* wait TM done for coming data read */
+		msleep(MMC3416X_DELAY_TM_MS);
+#if READMD
+		/* Read MD */
+		data[0] = MMC3416X_REG_DS;
+		if (mmc3xxx_i2c_rx_data(data, 1) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		while (!(data[0] & 0x01)) {
+			msleep(1);
+			/* Read MD again*/
+			data[0] = MMC3416X_REG_DS;
+			if (mmc3xxx_i2c_rx_data(data, 1) < 0) {
+	                        mutex_unlock(&memsic->ecompass_lock);
+				return -EFAULT;
+                        }
+			
+			if (data[0] & 0x01) break;
+			MD_times++;
+			if (MD_times > 2) {
+	                        mutex_unlock(&memsic->ecompass_lock);
+		#if DEBUG
+				printk("TM not work!!");
+		#endif
+				return -EFAULT;
+			}
+		}
+#endif		
+		/* read xyz raw data */
+		read_idx++;
+		data[0] = MMC3416X_REG_DATA;
+		if (mmc3xxx_i2c_rx_data(data, 6) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+		vec[0] = data[1] << 8 | data[0];
+		vec[1] = data[3] << 8 | data[2];
+		vec[2] = data[5] << 8 | data[4];
+		vec[2] = 65536 - vec[2];	
+	/*#if DEBUG
+		printk("[X - %04x] [Y - %04x] [Z - %04x]\n", 
+			vec[0], vec[1], vec[2]);
+	#endif*/
+		if (copy_to_user(pa, vec, sizeof(vec))) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+
+		break;
+	case MMC3416X_IOC_ID:
+		data[0] = MMC3416X_REG_PRODUCTID_0;
+		if (mmc3xxx_i2c_rx_data(data, 1) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+                data[14] = data[0];
+		data[0] = MMC3416X_REG_PRODUCTID_1;
+		if (mmc3xxx_i2c_rx_data(data, 1) < 0) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+		}
+                data[15] = data[0];
+                flag = data[15] << 8 | data[14];
+		if (copy_to_user(pa, &flag, sizeof(flag))) {
+	                mutex_unlock(&memsic->ecompass_lock);
+			return -EFAULT;
+                }
+                break;
+	default:
+		break;
+	}
+	mutex_unlock(&memsic->ecompass_lock);
+
+	return 0;
+}
+
+static ssize_t mmc3416x_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	ssize_t ret = 0;
+
+	sprintf(buf, "MMC3416X");
+	ret = strlen(buf) + 1;
+
+	return ret;
+}
+
+static DEVICE_ATTR(mmc3416x, S_IRUGO, mmc3416x_show, NULL);
+
+static struct file_operations mmc3416x_fops = {
+	.owner		= THIS_MODULE,
+	.open		= mmc3416x_open,
+	.release	= mmc3416x_release,
+	.unlocked_ioctl = mmc3416x_ioctl,
+};
+
+static struct miscdevice mmc3416x_device = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = MMC3416X_DEV_NAME,
+	.fops = &mmc3416x_fops,
+};
 
 static void mmc3416x_poll(struct work_struct *work)
 {
@@ -619,6 +931,19 @@ static int mmc3416x_probe(struct i2c_client *client, const struct i2c_device_id 
 		goto out;
 	}
 
+	this_client = client;
+
+	res = misc_register(&mmc3416x_device);
+	if (res) {
+		pr_err("%s: mmc3416x_device register failed\n", __FUNCTION__);
+		goto out;
+	}
+	res = device_create_file(&client->dev, &dev_attr_mmc3416x);
+	if (res) {
+		pr_err("%s: device_create_file failed\n", __FUNCTION__);
+		misc_deregister(&mmc3416x_device);
+	}
+
 	memsic = devm_kzalloc(&client->dev, sizeof(struct mmc3416x_data),
 			GFP_KERNEL);
 	if (!memsic) {
@@ -727,6 +1052,9 @@ static int mmc3416x_remove(struct i2c_client *client)
 	if (memsic->data_wq)
 		destroy_workqueue(memsic->data_wq);
 	mmc3416x_power_deinit(memsic);
+
+	device_remove_file(&client->dev, &dev_attr_mmc3416x);
+	misc_deregister(&mmc3416x_device);
 
 	if (memsic->idev)
 		input_unregister_device(memsic->idev);
